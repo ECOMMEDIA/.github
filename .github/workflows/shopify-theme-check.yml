@@ -1,0 +1,132 @@
+# =============================================================================
+# Workflow reutilizable — theme check de un theme Shopify (Ecommedia)
+#
+#   PR a develop o a main → `shopify theme check` en la rama base y en la del PR.
+#                           Solo fallan los errores NUEVOS (los themes de vendor ya traen errores).
+#                           Comenta el resultado en el PR.
+#
+# Sin secretos de Shopify: el CI no toca ninguna tienda. Staging (`estore stage`), producción
+# (`estore release`) y el vigía del live (`estore watch`) se ejecutan en local con el token de
+# `store auth` de una persona.
+#
+# Uso (en el repo del cliente, .github/workflows/shopify-check.yml):
+#   on:
+#     pull_request:
+#       branches: [develop, main]
+#   jobs:
+#     theme-check:
+#       uses: ECOMMEDIA/.github/.github/workflows/shopify-theme-check.yml@main
+# =============================================================================
+name: shopify-theme-check
+
+on:
+  workflow_call:
+    inputs:
+      node-version:
+        description: Versión de Node.js
+        type: string
+        default: "20"
+      cli-version:
+        description: Versión de @shopify/cli (npm)
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Theme check (solo errores nuevos)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      pull-requests: write
+    concurrency:
+      group: theme-check-${{ github.repository }}-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Instalar Shopify CLI
+        run: npm install -g "@shopify/cli@${{ inputs.cli-version }}"
+
+      - name: Theme check en la rama base y en la del PR
+        id: compare
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          # Base de comparación: la rama destino del PR (o el commit anterior si se llama en un push).
+          if [ "$EVENT" = "pull_request" ]; then base="origin/$BASE_REF"
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+               && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then base="$BEFORE"
+          else base=""; fi
+
+          errors() {  # $1 = directorio del theme → claves "ruta|check|mensaje", una por línea
+            local dir; dir="$(cd "$1" && pwd -P)"
+            shopify theme check --path "$dir" --output json --fail-level crash > "$RUNNER_TEMP/tc.json" 2>"$RUNNER_TEMP/tc.err" || true
+            jq -r --arg r "$dir/" '.[] | (.path | ltrimstr($r)) as $p | .offenses[]
+                | select(.severity == "error" or .severity == 0)
+                | "\($p)|\(.check)|\(.message | gsub("[\n|]"; " "))"' "$RUNNER_TEMP/tc.json" | sort -u
+          }
+
+          [ -f layout/theme.liquid ] || { echo "::warning::No hay layout/theme.liquid: no parece un theme. Nada que comprobar."; echo "new_errors=0" >> "$GITHUB_OUTPUT"; exit 0; }
+          errors . > "$RUNNER_TEMP/head.txt"
+          if [ -n "$base" ] && git worktree add -q --detach "$RUNNER_TEMP/base" "$base" 2>/dev/null \
+             && [ -f "$RUNNER_TEMP/base/layout/theme.liquid" ]; then
+            errors "$RUNNER_TEMP/base" > "$RUNNER_TEMP/base.txt"
+          else
+            echo "::warning::Sin rama base con theme para comparar: todos los errores cuentan como nuevos."
+            : > "$RUNNER_TEMP/base.txt"
+          fi
+          comm -13 "$RUNNER_TEMP/base.txt" "$RUNNER_TEMP/head.txt" > "$RUNNER_TEMP/new.txt"
+          total="$(wc -l < "$RUNNER_TEMP/head.txt" | tr -d ' ')"
+          new="$(wc -l < "$RUNNER_TEMP/new.txt" | tr -d ' ')"
+          echo "new_errors=$new" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Theme check"
+            echo
+            echo "- Errores en total: **$total** (comparado con: \`${base:-nada}\`)"
+            echo "- Errores **nuevos**: **$new**"
+            if [ "$new" -gt 0 ]; then
+              echo
+              echo '| Fichero | Check | Mensaje |'
+              echo '|---|---|---|'
+              head -n 30 "$RUNNER_TEMP/new.txt" | awk -F'|' '{ printf "| `%s` | %s | %s |\n", $1, $2, $3 }'
+            fi
+          } > "$RUNNER_TEMP/summary.md"
+          cat "$RUNNER_TEMP/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          while IFS='|' read -r p c m; do echo "::error file=$p,title=$c::$m"; done < "$RUNNER_TEMP/new.txt"
+
+      - name: Comentar en el PR
+        if: always() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          NEW: ${{ steps.compare.outputs.new_errors }}
+        run: |
+          {
+            if [ "${NEW:-x}" = "0" ]; then echo "## ✅ Theme check OK"
+            else echo "## ❌ Theme check: ${NEW:-?} error(es) nuevo(s)"; fi
+            echo
+            [ -f "$RUNNER_TEMP/summary.md" ] && cat "$RUNNER_TEMP/summary.md"
+            echo
+            echo "<sub>ecommedia-shopify · staging: \`estore stage\` · producción: \`estore release\` (una persona, en local)</sub>"
+          } > "$RUNNER_TEMP/comment.md"
+          gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md" --edit-last --create-if-none 2>/dev/null \
+            || gh pr comment "$PR" --body-file "$RUNNER_TEMP/comment.md"
+
+      - name: Fallar si hay errores nuevos
+        if: steps.compare.outputs.new_errors != '0'
+        run: |
+          echo "::error::Hay ${{ steps.compare.outputs.new_errors }} error(es) nuevo(s) de theme check."
+          exit 1
